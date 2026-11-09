@@ -1,0 +1,4 @@
+logs/
+*.log
+*.exe
+.DS_Store
