@@ -262,7 +262,7 @@ function Invoke-Robocopy([string]$Src, [string]$Dst, [string[]]$Options, [string
     while (-not $p.HasExited) { Start-Sleep -Milliseconds 400; DoEvents }
     $p.WaitForExit()
     try {
-        Get-Content -LiteralPath $rlog -Tail 12 -ErrorAction Stop |
+        Get-Content -LiteralPath $rlog -Tail 12 -Encoding Unicode -ErrorAction Stop |
             Where-Object { $_ -match '^\s*\S[^:]*:\s+\d' } |
             ForEach-Object { Log ('  ' + ($_ -replace '\s{2,}', ' ').Trim()) }
     } catch { }
@@ -329,8 +329,10 @@ function Restore-Junctions([string]$Root, $Junctions) {
             # Служебные ссылки Windows (Application Data, Local Settings, My Documents...):
             # у самой ссылки стоит запрет на чтение списка папки для всех (чтобы обходчики не зацикливались)
             # и атрибуты Hidden+System. /l - применить к самой ссылке, не к цели.
-            & icacls.exe "$full" /deny '*S-1-1-0:(S,RD)' /l /q 2>&1 | Out-Null
+            # Сначала атрибуты, потом запрет; запрещаем только RD (list directory), а не SYNCHRONIZE (S),
+            # иначе attrib/rmdir/Get-Item к самой ссылке получают "отказано в доступе".
             & attrib.exe +h +s "$full" /l 2>&1 | Out-Null
+            & icacls.exe "$full" /deny '*S-1-1-0:(RD)' /l /q 2>&1 | Out-Null
         } elseif ($attrs -match 'Hidden') {
             & attrib.exe +h "$full" /l 2>&1 | Out-Null
         }
