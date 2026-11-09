@@ -36,12 +36,16 @@ $Script:ExcludeFiles = @('*.tmp', '~$*')
 $Script:IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $Script:IsAdmin) {
     if ($PSCommandPath) {
-        Start-Process powershell.exe -Verb RunAs -ArgumentList "-NoProfile -ExecutionPolicy Bypass -STA -File `"$PSCommandPath`""
+        Start-Process powershell.exe -Verb RunAs -ArgumentList "-NoProfile -ExecutionPolicy Bypass -STA -File `"$PSCommandPath`" -User `"$User`" -GoldenRoot `"$GoldenRoot`" -BackupRoot `"$BackupRoot`""
         exit
     }
     [System.Windows.Forms.MessageBox]::Show('Запустите программу от имени администратора.', 'GoldenUser', 'OK', 'Error') | Out-Null
     exit 1
 }
+
+# Вывод консольных утилит (net, robocopy) на русской Windows идёт в OEM-кодировке (CP866).
+# Без консоли (ps2exe -noConsole) PowerShell по умолчанию читает его как ANSI - выставляем явно.
+try { [Console]::OutputEncoding = [System.Text.Encoding]::GetEncoding([System.Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage) } catch { }
 
 # ------------------------------------------------------------------ GUI
 [System.Windows.Forms.Application]::EnableVisualStyles()
@@ -132,12 +136,28 @@ function Confirm([string]$text, [string]$title = 'Подтверждение') {
     return ($r -eq 'Yes')
 }
 
+function Assert-SafeFolder([string]$path, [string]$label) {
+    # Запрещаем корень диска и системные папки: на них нельзя менять ACL и складывать эталон.
+    if (-not [IO.Path]::IsPathRooted($path)) { throw "$label должна быть абсолютным путём (например, C:\Golden): '$path'." }
+    $full = [IO.Path]::GetFullPath($path).TrimEnd('\')
+    $rootOfDrive = [IO.Path]::GetPathRoot($full).TrimEnd('\')
+    if ($full -ieq $rootOfDrive) { throw "$label не может быть корнем диска ($path). Укажите подпапку, например ${rootOfDrive}\Golden." }
+    $forbidden = @($env:SystemRoot, "$env:SystemDrive\Users", $env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramData) | Where-Object { $_ }
+    foreach ($f in $forbidden) {
+        $f = $f.TrimEnd('\')
+        if ($full -ieq $f -or $full.StartsWith("$f\", [StringComparison]::OrdinalIgnoreCase)) { throw "$label не может находиться в системной папке $f." }
+    }
+    return $full
+}
+
 function Get-Paths {
     $name   = $txtUser.Text.Trim()
-    $root   = $txtGolden.Text.Trim().TrimEnd('\')
-    $backup = $txtBackup.Text.Trim().TrimEnd('\')
+    $root   = $txtGolden.Text.Trim()
+    $backup = $txtBackup.Text.Trim()
     if (-not $name) { throw 'Не указано имя пользователя.' }
     if (-not $root) { throw 'Не указана папка эталонов.' }
+    $root = Assert-SafeFolder $root 'Папка эталонов'
+    if ($backup) { $backup = Assert-SafeFolder $backup 'Папка резервных копий' }
     [pscustomobject]@{
         Name       = $name
         GoldenRoot = $root
@@ -150,10 +170,14 @@ function Get-Paths {
     }
 }
 
-function Ensure-GoldenRoot([string]$root) {
-    if (-not (Test-Path -LiteralPath $root)) { New-Item -ItemType Directory -Path $root -Force | Out-Null }
+function Ensure-GoldenRoot([string]$root, [switch]$SetAcl) {
+    $created = $false
+    if (-not (Test-Path -LiteralPath $root)) { New-Item -ItemType Directory -Path $root -Force | Out-Null; $created = $true }
     # Только SYSTEM и Администраторы, наследование отключено. SID-ы, чтобы не зависеть от языка Windows.
-    & icacls.exe "$root" /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' /q | Out-Null
+    # ACL меняем только при создании папки или при снятии эталона - кнопка "Проверить" прав не трогает.
+    if ($created -or $SetAcl) {
+        & icacls.exe "$root" /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' /q | Out-Null
+    }
     $logDir = Join-Path $root 'logs'
     if (-not (Test-Path -LiteralPath $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
     $Script:LogFile = Join-Path $root 'GoldenUser.log'
@@ -176,7 +200,19 @@ function Get-TargetUser([string]$name) {
 }
 
 function Test-HiveLoaded([string]$sid) {
-    return (Test-Path -LiteralPath "Registry::HKEY_USERS\$sid")
+    # NTUSER.DAT -> HKU\<SID>, UsrClass.dat -> HKU\<SID>_Classes; оба должны быть выгружены
+    return ((Test-Path -LiteralPath "Registry::HKEY_USERS\$sid") -or (Test-Path -LiteralPath "Registry::HKEY_USERS\${sid}_Classes"))
+}
+
+function Stop-UserProcesses($u) {
+    try {
+        $procs = Get-Process -IncludeUserName -ErrorAction SilentlyContinue |
+            Where-Object { $_.UserName -and ($_.UserName -split '\\')[-1] -ieq $u.Name }
+        foreach ($pr in @($procs)) {
+            Warn "Завершаю процесс $($pr.ProcessName) (PID $($pr.Id)) пользователя $($u.Name)"
+            Stop-Process -Id $pr.Id -Force -ErrorAction SilentlyContinue
+        }
+    } catch { }
 }
 
 function Get-UserSessions([string]$name) {
@@ -199,18 +235,16 @@ function Ensure-LoggedOff($u) {
         Log "Завершаю сеанс #$id пользователя $($u.Name) (несохранённые документы будут потеряны)..."
         & logoff.exe $id 2>$null
     }
+    if ($sessions) { Start-Sleep -Seconds 5; DoEvents }
+    # Фоновые процессы пользователя (OneDrive, Teams, задачи планировщика) держат файлы в AppData
+    # даже после выхода - завершаем безусловно.
+    Stop-UserProcesses $u
     $deadline = (Get-Date).AddSeconds(90)
+    $tick = 0
     while ((Test-HiveLoaded $u.Sid) -and (Get-Date) -lt $deadline) {
         Set-Status 'Жду выгрузки профиля пользователя...'
         Start-Sleep -Milliseconds 1000; DoEvents
-        if (((Get-Date) - $deadline).TotalSeconds -gt -60) {
-            # через 30 с - добиваем оставшиеся процессы пользователя
-            try {
-                Get-Process -IncludeUserName -ErrorAction SilentlyContinue |
-                    Where-Object { $_.UserName -and ($_.UserName -split '\\')[-1] -ieq $u.Name } |
-                    ForEach-Object { Warn "Завершаю процесс $($_.ProcessName) (PID $($_.Id))"; Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue }
-            } catch { }
-        }
+        if ((++$tick % 15) -eq 0) { Stop-UserProcesses $u }
     }
     if (Test-HiveLoaded $u.Sid) {
         throw "Куст реестра пользователя $($u.Name) всё ещё загружен. Перезагрузите ПК, войдите ТОЛЬКО под администратором и повторите."
@@ -221,7 +255,8 @@ function Ensure-LoggedOff($u) {
 function Invoke-Robocopy([string]$Src, [string]$Dst, [string[]]$Options, [string]$LogName) {
     $Src = $Src.TrimEnd('\'); $Dst = $Dst.TrimEnd('\')
     $rlog = Join-Path (Get-Paths).LogDir ("{0}_{1}.log" -f $LogName, (Get-Date -Format 'yyyyMMdd_HHmmss'))
-    $rcArgs = @("`"$Src`"", "`"$Dst`"") + $Options + @('/R:2', '/W:2', '/NP', '/NFL', '/NDL', '/NJH', "/LOG:`"$rlog`"")
+    # /UNILOG - журнал в Unicode, чтобы русские строки читались независимо от кодовой страницы
+    $rcArgs = @("`"$Src`"", "`"$Dst`"") + $Options + @('/R:2', '/W:2', '/NP', '/NFL', '/NDL', '/NJH', "/UNILOG:`"$rlog`"")
     Log ("robocopy " + ($rcArgs -join ' '))
     $p = Start-Process -FilePath robocopy.exe -ArgumentList ($rcArgs -join ' ') -PassThru -WindowStyle Hidden
     while (-not $p.HasExited) { Start-Sleep -Milliseconds 400; DoEvents }
@@ -246,20 +281,33 @@ function Invoke-Icacls([string[]]$IcaclsArgs) {
 function Get-Junctions([string]$Root) {
     # Соединения (junction) и символические ссылки на папки внутри профиля:
     # robocopy /XJ их не копирует, поэтому запоминаем и пересоздаём при восстановлении.
-    $list = @()
-    $lines = & cmd.exe /c "dir `"$Root`" /AL /S /B" 2>$null
-    foreach ($l in $lines) {
-        if (-not $l) { continue }
-        try { $it = Get-Item -LiteralPath $l -Force -ErrorAction Stop } catch { continue }
-        if ($it.PSIsContainer -and ($it.LinkType -eq 'Junction' -or $it.LinkType -eq 'SymbolicLink')) {
-            $target = @($it.Target)[0]
-            if (-not $target) { continue }
-            $list += [pscustomobject]@{
-                Path   = $l.Substring($Root.Length).TrimStart('\')
-                Target = [string]$target
-                Type   = [string]$it.LinkType
+    # Обход своей очередью, НЕ заходя внутрь reparse point: иначе петля
+    # AppData\Local\Application Data -> AppData\Local уводит в бесконечную рекурсию.
+    $list  = New-Object System.Collections.Generic.List[object]
+    $queue = New-Object System.Collections.Generic.Queue[string]
+    $queue.Enqueue($Root)
+    $n = 0
+    while ($queue.Count -gt 0) {
+        $dir = $queue.Dequeue()
+        $children = Get-ChildItem -LiteralPath $dir -Directory -Force -ErrorAction SilentlyContinue
+        foreach ($d in @($children)) {
+            if ($d.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                if ($d.LinkType -eq 'Junction' -or $d.LinkType -eq 'SymbolicLink') {
+                    $target = @($d.Target)[0]
+                    if ($target) {
+                        $list.Add([pscustomobject]@{
+                            Path       = $d.FullName.Substring($Root.Length).TrimStart('\')
+                            Target     = [string]$target
+                            Type       = [string]$d.LinkType
+                            Attributes = [string]$d.Attributes
+                        })
+                    }
+                }
+            } else {
+                $queue.Enqueue($d.FullName)
             }
         }
+        if ((++$n % 200) -eq 0) { DoEvents }
     }
     return @($list | Sort-Object Path -Unique)
 }
@@ -274,7 +322,18 @@ function Restore-Junctions([string]$Root, $Junctions) {
         if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
         $flag = if ($j.Type -eq 'SymbolicLink') { '/D' } else { '/J' }
         & cmd.exe /c "mklink $flag `"$full`" `"$($j.Target)`"" 2>&1 | Out-Null
-        if (Test-Path -LiteralPath $full) { $n++ } else { Warn "Не удалось создать ссылку $full -> $($j.Target)" }
+        if (-not (Test-Path -LiteralPath $full)) { Warn "Не удалось создать ссылку $full -> $($j.Target)"; continue }
+        $n++
+        $attrs = [string]$j.Attributes
+        if ($attrs -match 'System') {
+            # Служебные ссылки Windows (Application Data, Local Settings, My Documents...):
+            # у самой ссылки стоит запрет на чтение списка папки для всех (чтобы обходчики не зацикливались)
+            # и атрибуты Hidden+System. /l - применить к самой ссылке, не к цели.
+            & icacls.exe "$full" /deny '*S-1-1-0:(S,RD)' /l /q 2>&1 | Out-Null
+            & attrib.exe +h +s "$full" /l 2>&1 | Out-Null
+        } elseif ($attrs -match 'Hidden') {
+            & attrib.exe +h "$full" /l 2>&1 | Out-Null
+        }
     }
     Log "Пересоздано ссылок/соединений: $n"
 }
@@ -376,7 +435,7 @@ function Do-Check {
 
 function Do-Snapshot {
     $p = Get-Paths
-    Ensure-GoldenRoot $p.GoldenRoot
+    Ensure-GoldenRoot $p.GoldenRoot -SetAcl
     Log '========== СНЯТИЕ ЭТАЛОНА =========='
     $u = Get-TargetUser $p.Name
     Log "Пользователь $($u.Name) ($($u.Sid)), профиль $($u.Path)"
@@ -391,6 +450,8 @@ function Do-Snapshot {
     Stop-Indexer
     try {
         if (-not (Test-Path -LiteralPath $p.Golden)) { New-Item -ItemType Directory -Path $p.Golden -Force | Out-Null }
+        # Старый манифест убираем ДО копирования: прерванный снимок не должен считаться целым эталоном.
+        if (Test-Path -LiteralPath $p.Manifest) { Remove-Item -LiteralPath $p.Manifest -Force; Log 'Старый manifest.json удалён - эталон будет считаться готовым только после завершения.' }
 
         Set-Status 'Копирую профиль в эталон...'
         $opts = @('/MIR', '/COPY:DAT', '/DCOPY:DAT', '/B', '/XJ') + @('/XD') + ($Script:ExcludeDirs | ForEach-Object { "`"$_`"" }) + @('/XF') + $Script:ExcludeFiles
@@ -458,38 +519,49 @@ function Do-Restore {
         $(if ($chkReboot.Checked) { " 6. Компьютер перезагружается.`n" } else { '' }) +
         "`nПродолжить?"
     if (-not (Confirm $actions 'ВОССТАНОВЛЕНИЕ ЭТАЛОНА')) { Warn 'Отменено.'; return }
+    if ($chkBackup.Checked -and -not $p.BackupRoot) { throw 'Включено сохранение старого профиля, но папка резервных копий не указана.' }
 
     Ensure-LoggedOff $u
     Stop-Indexer
     $oldPath = $null
+    $moved = $false      # старый профиль переименован
+    $committed = $false  # новый профиль скопирован целиком - откат больше не нужен
     try {
         # --- 1. убираем текущий профиль с дороги (переименование = мгновенно, на том же диске)
-        $stamp = Get-Date -Format 'yyyyMMdd_HHmm'
-        if ($chkBackup.Checked -and $p.BackupRoot) {
+        $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+        if ($chkBackup.Checked) {
             if (-not (Test-Path -LiteralPath $p.BackupRoot)) { New-Item -ItemType Directory -Path $p.BackupRoot -Force | Out-Null }
             & icacls.exe "$($p.BackupRoot)" /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' /q | Out-Null
             $oldPath = Join-Path $p.BackupRoot "$($u.Name)_$stamp"
         } else {
             $oldPath = "$($u.Path).old_$stamp"
         }
+        if (Test-Path -LiteralPath $oldPath) { $oldPath = "${oldPath}_$(Get-Random -Maximum 9999)" }
         $sameDrive = ([IO.Path]::GetPathRoot($oldPath) -ieq [IO.Path]::GetPathRoot($u.Path))
         if (-not $sameDrive) { throw "Папка резервных копий должна быть на том же диске, что и профиль ($([IO.Path]::GetPathRoot($u.Path)))." }
 
         Set-Status 'Переношу текущий профиль...'
-        $moved = $false
         for ($i = 1; $i -le 5 -and -not $moved; $i++) {
             try { Move-Item -LiteralPath $u.Path -Destination $oldPath -Force -ErrorAction Stop; $moved = $true }
             catch { Warn "Попытка $i/5: папка профиля занята ($($_.Exception.Message)). Жду 3 с..."; Start-Sleep -Seconds 3; DoEvents }
         }
         if (-not $moved) { throw "Не удалось переместить $($u.Path). Закройте проводник/программы, открывающие эту папку, и повторите." }
         Log "Старый профиль перемещён: $oldPath"
-        Remove-JunctionsIn $oldPath
 
         # --- 2. копируем эталон на место
         Set-Status 'Копирую эталон в профиль...'
         New-Item -ItemType Directory -Path $u.Path -Force | Out-Null
         $rc = Invoke-Robocopy $p.Profile $u.Path @('/E', '/COPY:DAT', '/DCOPY:DAT', '/B', '/XJ') 'restore'
-        if ($rc -ge 8) { Fail "robocopy вернул код $rc - часть файлов не скопирована. Проверьте лог, прежде чем отдавать ПК." }
+        if ($rc -ge 8) { throw "robocopy вернул код $rc - эталон скопирован не полностью. Старый профиль возвращён на место, ничего не удалено." }
+        $committed = $true
+        # Старый профиль больше не нужен как источник отката: убираем из него соединения,
+        # которые абсолютными путями указывают в НОВЫЙ профиль.
+        Remove-JunctionsIn $oldPath
+
+        # Папки, исключённые из эталона, но обязательные для работы (TEMP/TMP указывают сюда)
+        foreach ($rel in @('AppData\Local\Temp', 'AppData\Local\Microsoft\Windows\INetCache', 'AppData\Local\Microsoft\Windows\WER')) {
+            New-Item -ItemType Directory -Path (Join-Path $u.Path $rel) -Force -ErrorAction SilentlyContinue | Out-Null
+        }
 
         # --- 3. права доступа: восстанавливаем сохранённые ACL, владелец - пользователь
         Set-Status 'Восстанавливаю права доступа...'
@@ -520,13 +592,35 @@ function Do-Restore {
         }
 
         # --- 7. пароль и PIN
-        if ($chkPwd.Checked) { Reset-Password $u.Name | Out-Null }
+        $pwdOk = $true
+        if ($chkPwd.Checked) { $pwdOk = [bool](Reset-Password $u.Name) }
         if ($chkPin.Checked) { Reset-Pin }
 
         Log "ВОССТАНОВЛЕНИЕ ЗАВЕРШЕНО. Эталон от $($m.Date)."
         Set-Status 'Готово.'
+    } catch {
+        if ($moved -and -not $committed) {
+            # Откат: убираем недокопированный новый профиль и возвращаем старый на место
+            Warn 'Ошибка на этапе копирования - откатываю: возвращаю старый профиль на место...'
+            try {
+                if (Test-Path -LiteralPath $u.Path) { & cmd.exe /c "rmdir /s /q `"$($u.Path)`"" 2>&1 | Out-Null }
+                Move-Item -LiteralPath $oldPath -Destination $u.Path -Force -ErrorAction Stop
+                Log "Старый профиль возвращён: $($u.Path)"
+            } catch {
+                Fail "ОТКАТ НЕ УДАЛСЯ: старый профиль лежит в $oldPath, верните его вручную в $($u.Path). $($_.Exception.Message)"
+            }
+        }
+        throw
     } finally {
         Start-Indexer
+    }
+
+    if (-not $pwdOk) {
+        [System.Windows.Forms.MessageBox]::Show($form,
+            "Профиль восстановлен, но пароль пользователя '$($u.Name)' НЕ сброшен на пустой.`n`nБез этого пользователь не войдёт, а сохранённые пароли (сетевые диски, Credential Manager) не откроются.`n`nВыполните в консоли администратора:`n  net accounts /minpwlen:0`n  net user $($u.Name) `"`"`n`nПерезагрузка отменена - сделайте её вручную после сброса пароля.",
+            'GoldenUser - пароль не сброшен', 'OK', 'Warning') | Out-Null
+        Warn 'Перезагрузка отменена: сначала сбросьте пароль.'
+        return
     }
 
     if ($chkReboot.Checked) {
