@@ -29,7 +29,9 @@ Add-Type -AssemblyName System.Drawing
 
 # ------------------------------------------------------------------ настройки
 # Папки с мусором, которые НЕ попадают в эталон (сравнение по имени папки, на любой глубине).
-$Script:ExcludeDirs  = @('Temp', 'INetCache', 'WER', 'Cache', 'Code Cache', 'GPUCache', 'cache2', 'CrashDumps', 'CacheStorage', 'ShaderCache')
+# WindowsApps - псевдонимы выполнения приложений (App Execution Aliases): reparse-точки, которые
+# нельзя скопировать как файлы (robocopy: ERROR 1920); Windows пересоздаёт их при входе пользователя.
+$Script:ExcludeDirs  = @('Temp', 'INetCache', 'WER', 'Cache', 'Code Cache', 'GPUCache', 'cache2', 'CrashDumps', 'CacheStorage', 'ShaderCache', 'WindowsApps')
 $Script:ExcludeFiles = @('*.tmp', '~$*')
 
 # ------------------------------------------------------------------ права администратора
@@ -256,7 +258,7 @@ function Invoke-Robocopy([string]$Src, [string]$Dst, [string[]]$Options, [string
     $Src = $Src.TrimEnd('\'); $Dst = $Dst.TrimEnd('\')
     $rlog = Join-Path (Get-Paths).LogDir ("{0}_{1}.log" -f $LogName, (Get-Date -Format 'yyyyMMdd_HHmmss'))
     # /UNILOG - журнал в Unicode, чтобы русские строки читались независимо от кодовой страницы
-    $rcArgs = @("`"$Src`"", "`"$Dst`"") + $Options + @('/R:2', '/W:2', '/NP', '/NFL', '/NDL', '/NJH', "/UNILOG:`"$rlog`"")
+    $rcArgs = @("`"$Src`"", "`"$Dst`"") + $Options + @('/R:1', '/W:1', '/NP', '/NFL', '/NDL', '/NJH', "/UNILOG:`"$rlog`"")
     Log ("robocopy " + ($rcArgs -join ' '))
     $p = Start-Process -FilePath robocopy.exe -ArgumentList ($rcArgs -join ' ') -PassThru -WindowStyle Hidden
     while (-not $p.HasExited) { Start-Sleep -Milliseconds 400; DoEvents }
@@ -561,7 +563,7 @@ function Do-Restore {
         Remove-JunctionsIn $oldPath
 
         # Папки, исключённые из эталона, но обязательные для работы (TEMP/TMP указывают сюда)
-        foreach ($rel in @('AppData\Local\Temp', 'AppData\Local\Microsoft\Windows\INetCache', 'AppData\Local\Microsoft\Windows\WER')) {
+        foreach ($rel in @('AppData\Local\Temp', 'AppData\Local\Microsoft\Windows\INetCache', 'AppData\Local\Microsoft\Windows\WER', 'AppData\Local\Microsoft\WindowsApps')) {
             New-Item -ItemType Directory -Path (Join-Path $u.Path $rel) -Force -ErrorAction SilentlyContinue | Out-Null
         }
 

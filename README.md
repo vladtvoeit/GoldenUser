@@ -59,7 +59,9 @@ Invoke-ps2exe .\GoldenUser.ps1 .\GoldenUser.exe -requireAdmin -noConsole -title 
 `HKCU` целиком (файл `NTUSER.DAT`), сетевые диски (`HKCU\Network`), подключения к сетевым принтерам,
 Credential Manager, настройки всех программ в `AppData`, раскладка «Пуск», Office.
 
-Не попадает в эталон (намеренно): папки `Temp`, кэши браузеров и приложений, `*.tmp`.
+Не попадает в эталон (намеренно): папки `Temp`, кэши браузеров и приложений, `*.tmp`,
+а также `AppData\Local\Microsoft\WindowsApps` — псевдонимы приложений Store (`winget.exe`, `notepad.exe`…),
+это reparse-точки, которые нельзя скопировать; Windows пересоздаёт их при входе.
 Список — переменные `$Script:ExcludeDirs` / `$Script:ExcludeFiles` в начале скрипта.
 
 Не входит в профиль и не трогается: установленные программы, драйверы, обновления Windows,
