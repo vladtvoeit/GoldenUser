@@ -10,6 +10,7 @@
 |---|---|
 | `GoldenUser.ps1` | сама программа (PowerShell 5.1 + WinForms) |
 | `GoldenUser.cmd` | запуск `.ps1` двойным щелчком, без настройки ExecutionPolicy |
+| `run.ps1` | загрузчик для запуска одной строкой `irm https://tvoe.it/gu \| iex` |
 | `README.md` | этот файл |
 
 ## Запуск
@@ -27,6 +28,32 @@ Invoke-ps2exe .\GoldenUser.ps1 .\GoldenUser.exe -requireAdmin -noConsole -title 
 
 Получится `GoldenUser.exe`, который сам запрашивает права администратора.
 Если антивирус ругается на ps2exe-сборку — добавьте файл в исключения или используйте вариант А.
+
+Вариант В — одной строкой из интернета (ничего не копировать на ноутбук). Открыть PowerShell
+(лучше сразу от имени администратора) и вставить:
+
+```powershell
+irm https://tvoe.it/gu | iex
+```
+
+Загрузчик (`run.ps1`, на сайте он лежит как `tvoe.it/gu/index.html` в репозитории `tvoeit-brand`):
+поднимает права, если их нет; скачивает `GoldenUser.ps1` строго версии из `$Version` с GitHub;
+сверяет SHA256 и при несовпадении ничего не запускает; кладёт файл в `C:\Program Files\GoldenUser\`
+(обычные пользователи туда писать не могут) и запускает окно GoldenUser. Эталоны и журналы — как обычно,
+в `C:\Golden`. Пишите ссылку именно с `https://`: без него PowerShell сначала идёт по незащищённому `http`.
+
+На старой Windows 10, если ругается на TLS/SSL:
+
+```powershell
+[Net.ServicePointManager]::SecurityProtocol = 'Tls12'; irm https://tvoe.it/gu | iex
+```
+
+Без интернета уже скачанную версию можно запустить так:
+`powershell -ExecutionPolicy Bypass -STA -File "C:\Program Files\GoldenUser\GoldenUser.ps1"`.
+
+Выпуск новой версии: закоммитить `GoldenUser.ps1`, поставить метку (`git tag v1.1 && git push origin v1.1`),
+в `run.ps1` поменять `$Version` и `$Sha256` (`shasum -a 256 GoldenUser.ps1`), закоммитить и скопировать
+`run.ps1` в `tvoeit-brand/gu/index.html`. Пока загрузчик не обновлён, ноутбуки получают прежнюю проверенную версию.
 
 ## Порядок работы
 

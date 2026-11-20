@@ -2,3 +2,5 @@ logs/
 *.log
 *.exe
 .DS_Store
+.gemini-review/
+.review.md
