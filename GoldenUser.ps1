@@ -92,13 +92,14 @@ $txtBackup = New-TextBox $BackupRoot 140  72 590
 $chkPwd    = New-CheckBox 'Сбросить пароль пользователя на пустой'              12 104 360 $true
 $chkPin    = New-CheckBox 'Сбросить PIN (Windows Hello) - для всех учёток ПК'   12 128 360 $false
 $chkBackup = New-CheckBox 'Сохранить старый профиль в папку резервных копий'   380 104 360 $true
-$chkReboot = New-CheckBox 'Перезагрузить компьютер после восстановления'        380 128 360 $true
+$chkReboot = New-CheckBox 'Перезагрузить компьютер после восстановления/очистки' 380 128 360 $true
 
-$btnCheck    = New-Button 'Проверить'       12  162 120
-$btnSnapshot = New-Button 'Снять эталон'    140 162 150
-$btnRestore  = New-Button 'ВОССТАНОВИТЬ'    300 162 170
+$btnCheck    = New-Button 'Проверить'              12  162 104
+$btnSnapshot = New-Button 'Снять эталон'           122 162 120
+$btnRestore  = New-Button 'ВОССТАНОВИТЬ'           248 162 150
 $btnRestore.Font = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
-$btnOpen     = New-Button 'Открыть папку эталонов' 480 162 170
+$btnClean    = New-Button 'Очистить профиль'       404 162 150
+$btnOpen     = New-Button 'Папка эталонов'         560 162 170
 
 $txtLog = New-Object System.Windows.Forms.TextBox
 $txtLog.Multiline = $true; $txtLog.ScrollBars = 'Vertical'; $txtLog.ReadOnly = $true; $txtLog.WordWrap = $false
@@ -128,7 +129,7 @@ function Fail([string]$m) { Log $m 'ERROR' }
 function Set-Status([string]$text) { $lblStatus.Text = $text; DoEvents }
 
 function Set-Busy([bool]$busy) {
-    foreach ($b in @($btnCheck, $btnSnapshot, $btnRestore, $btnOpen)) { $b.Enabled = -not $busy }
+    foreach ($b in @($btnCheck, $btnSnapshot, $btnRestore, $btnClean, $btnOpen)) { $b.Enabled = -not $busy }
     $form.UseWaitCursor = $busy
     DoEvents
 }
@@ -185,19 +186,20 @@ function Ensure-GoldenRoot([string]$root, [switch]$SetAcl) {
     $Script:LogFile = Join-Path $root 'GoldenUser.log'
 }
 
-function Get-TargetUser([string]$name) {
+function Get-TargetUser([string]$name, [switch]$AllowNoProfile) {
     $lu = Get-LocalUser -Name $name -ErrorAction Stop
     $sid = $lu.SID.Value
     $me  = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
     if ($me -eq $sid) { throw "Вы вошли как '$name'. Запускайте инструмент из другой (административной) учётной записи." }
     $prof = Get-CimInstance Win32_UserProfile -Filter "SID='$sid'" -ErrorAction Stop
-    if (-not $prof) { throw "У пользователя '$name' ещё нет профиля на этом ПК (он ни разу не входил)." }
+    if (-not $prof -and -not $AllowNoProfile) { throw "У пользователя '$name' ещё нет профиля на этом ПК (он ни разу не входил)." }
     [pscustomobject]@{
         Name    = $lu.Name
         Sid     = $sid
-        Path    = $prof.LocalPath.TrimEnd('\')
+        Path    = $(if ($prof) { $prof.LocalPath.TrimEnd('\') } else { $null })
         Enabled = $lu.Enabled
-        Loaded  = [bool]$prof.Loaded
+        Loaded  = $(if ($prof) { [bool]$prof.Loaded } else { $false })
+        Source  = [string]$lu.PrincipalSource
     }
 }
 
@@ -416,9 +418,9 @@ function Do-Check {
     $p = Get-Paths
     Ensure-GoldenRoot $p.GoldenRoot
     Log '---------- Проверка ----------'
-    $u = Get-TargetUser $p.Name
-    Log "Пользователь:   $($u.Name)   SID: $($u.Sid)   включён: $($u.Enabled)"
-    Log "Папка профиля:  $($u.Path)"
+    $u = Get-TargetUser $p.Name -AllowNoProfile
+    Log "Пользователь:   $($u.Name)   SID: $($u.Sid)   включён: $($u.Enabled)   тип: $($u.Source)"
+    Log ("Папка профиля:  " + $(if ($u.Path) { $u.Path } else { 'профиля нет - будет создан чистый при следующем входе' }))
     $sess = Get-UserSessions $u.Name
     Log ("Сеансы в системе: " + $(if ($sess) { $sess -join ', ' } else { 'нет' }) + "   куст реестра загружен: " + (Test-HiveLoaded $u.Sid))
     $drive = (Get-Item -LiteralPath $p.GoldenRoot).PSDrive
@@ -635,6 +637,144 @@ function Do-Restore {
     }
 }
 
+function Report-OutsideProfile($u) {
+    # Следы предыдущего владельца, которые лежат ВНЕ профиля и удалением профиля не чистятся.
+    # Только сообщаем - решение за администратором.
+    $found = 0
+    try {
+        $isAdmin = Get-LocalGroupMember -SID 'S-1-5-32-544' -ErrorAction Stop | Where-Object { $_.SID.Value -eq $u.Sid }
+        if ($isAdmin) { Warn "Пользователь $($u.Name) состоит в группе Администраторы. Убрать: Remove-LocalGroupMember -SID S-1-5-32-544 -Member $($u.Name)"; $found++ }
+    } catch { Warn "Не удалось проверить группу Администраторы: $($_.Exception.Message)" }
+    if ($u.Source -eq 'MicrosoftAccount') { Warn "Учётная запись $($u.Name) привязана к учётной записи Microsoft. Отвяжите её в Параметры -> Учётные записи."; $found++ }
+    try {
+        $tasks = Get-ScheduledTask -ErrorAction Stop | Where-Object {
+            $id = [string]$_.Principal.UserId
+            $id -and (($id -split '\\')[-1] -ieq $u.Name -or $id -eq $u.Sid)
+        }
+        foreach ($t in @($tasks)) { Warn "Задача планировщика от имени $($u.Name): $($t.TaskPath)$($t.TaskName)"; $found++ }
+    } catch { }
+    if (-not $found) { Log 'Следов пользователя вне профиля (права администратора, учётка Microsoft, задачи планировщика) не найдено.' }
+}
+
+function Remove-ProfileListKeys([string]$sid) {
+    $pl = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList'
+    foreach ($k in @("$pl\$sid", "$pl\$sid.bak")) {
+        if (Test-Path -LiteralPath $k) { Remove-Item -LiteralPath $k -Recurse -Force -ErrorAction SilentlyContinue; Warn "Удалён оставшийся ключ $k" }
+    }
+    $pg = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileGuid'
+    if (Test-Path -LiteralPath $pg) {
+        Get-ChildItem -LiteralPath $pg -ErrorAction SilentlyContinue | ForEach-Object {
+            if ((Get-ItemProperty -LiteralPath $_.PSPath -ErrorAction SilentlyContinue).SidString -eq $sid) {
+                Remove-Item -LiteralPath $_.PSPath -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+}
+
+function Do-Clean {
+    $p = Get-Paths
+    Ensure-GoldenRoot $p.GoldenRoot
+    Log '========== ОЧИСТКА ПРОФИЛЯ (как новый пользователь) =========='
+    $u = Get-TargetUser $p.Name -AllowNoProfile
+    $profPath = if ($u.Path) { $u.Path } else { Join-Path (Split-Path $env:PUBLIC -Parent) $u.Name }
+
+    if ($chkBackup.Checked -and -not $p.BackupRoot) { throw 'Включено сохранение старого профиля, но папка резервных копий не указана.' }
+
+    $actions = "Будет выполнено для пользователя '$($u.Name)':`n`n" +
+        " 1. Принудительный выход пользователя из системы.`n" +
+        $(if ($u.Path) {
+            " 2. Профиль $($u.Path) " + $(if ($chkBackup.Checked) { "копируется в $($p.BackupRoot)\$($u.Name)_clean_<дата>,`n    затем " } else { '' }) +
+            "УДАЛЯЕТСЯ ПОЛНОСТЬЮ: рабочий стол, документы, загрузки, настройки программ,`n    сохранённые пароли, сетевые диски, принтеры, обои.`n"
+        } else { " 2. Профиля нет - удалять нечего.`n" }) +
+        " 3. При следующем входе Windows создаст новый чистый профиль.`n" +
+        $(if ($chkPwd.Checked)    { " 4. Пароль сбрасывается на пустой.`n" } else { '' }) +
+        $(if ($chkPin.Checked)    { " 5. Сбрасывается PIN Windows Hello (у всех учёток).`n" } else { '' }) +
+        $(if ($chkReboot.Checked) { " 6. Компьютер перезагружается.`n" } else { '' }) +
+        "`nУчётная запись, её имя и SID сохраняются. Эталон в $($p.Golden) (если есть) не трогается.`n`nПродолжить?"
+    if (-not (Confirm $actions 'ОЧИСТКА ПРОФИЛЯ')) { Warn 'Отменено.'; return }
+
+    Ensure-LoggedOff $u
+    Stop-Indexer
+    $pwdOk = $true
+    try {
+        if ($u.Path -and (Test-Path -LiteralPath $u.Path)) {
+            # --- 1. страховочная копия (копируем, а не переносим: удалять профиль должна сама Windows)
+            if ($chkBackup.Checked) {
+                if (-not (Test-Path -LiteralPath $p.BackupRoot)) { New-Item -ItemType Directory -Path $p.BackupRoot -Force | Out-Null }
+                & icacls.exe "$($p.BackupRoot)" /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' /q | Out-Null
+                $bak = Join-Path $p.BackupRoot ("{0}_clean_{1}" -f $u.Name, (Get-Date -Format 'yyyyMMdd_HHmmss'))
+                Set-Status 'Копирую старый профиль в резервную копию...'
+                $opts = @('/E', '/COPY:DAT', '/DCOPY:DAT', '/B', '/XJ') + @('/XD') + ($Script:ExcludeDirs | ForEach-Object { "`"$_`"" }) + @('/XF') + $Script:ExcludeFiles
+                $rc = Invoke-Robocopy $u.Path $bak $opts 'clean_backup'
+                if ($rc -ge 8) {
+                    if (-not (Confirm "Резервная копия сделана не полностью (robocopy код $rc, подробности в журнале).`n`nВсё равно удалить профиль?")) { Warn 'Отменено: профиль не тронут.'; return }
+                }
+                Invoke-Icacls @("`"$bak`"", '/remove:g', "*$($u.Sid)", '/t', '/c', '/q') | Out-Null
+                Log "Резервная копия старого профиля: $bak (доступ только администраторам)"
+            }
+
+            # --- 2. удаление профиля средствами Windows (папка + куст реестра + ProfileList)
+            Set-Status 'Удаляю профиль...'
+            try {
+                Get-CimInstance Win32_UserProfile -Filter "SID='$($u.Sid)'" -ErrorAction Stop | Remove-CimInstance -ErrorAction Stop
+                Log 'Профиль удалён средствами Windows.'
+            } catch {
+                Warn "Windows не удалила профиль целиком: $($_.Exception.Message). Дочищаю вручную..."
+            }
+        } else {
+            Log 'Папки профиля нет - пропускаю удаление.'
+        }
+
+        # --- 3. дочистка хвостов
+        if (Test-Path -LiteralPath $profPath) {
+            Remove-JunctionsIn $profPath
+            & cmd.exe /c "rmdir /s /q `"$profPath`"" 2>&1 | Out-Null
+        }
+        if (Test-Path -LiteralPath $profPath) {
+            # Что-то занято - убираем папку с дороги, чтобы новый профиль создался именно в C:\Users\<user>,
+            # а не в C:\Users\<user>.<ИМЯПК>.
+            $del = "$profPath.del_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+            try { Rename-Item -LiteralPath $profPath -NewName (Split-Path $del -Leaf) -ErrorAction Stop; Warn "Часть файлов занята - папка переименована в $del. Удалите её после перезагрузки: rmdir /s /q `"$del`"" }
+            catch { Fail "Не удалось удалить или переименовать $profPath. Перезагрузите ПК, войдите только под администратором и повторите очистку." }
+        }
+        Remove-ProfileListKeys $u.Sid
+
+        # --- 4. проверка
+        $pl = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList'
+        $left = @()
+        if (Test-Path -LiteralPath $profPath)             { $left += $profPath }
+        if (Test-Path -LiteralPath "$pl\$($u.Sid)")       { $left += "ProfileList\$($u.Sid)" }
+        if (Test-Path -LiteralPath "$pl\$($u.Sid).bak")   { $left += "ProfileList\$($u.Sid).bak" }
+        if ($left) { throw "Профиль удалён не полностью, осталось: $($left -join '; '). Перезагрузите ПК и повторите очистку - иначе при входе будет временный профиль." }
+        Log 'Проверка: папки профиля и записей ProfileList нет - при входе будет создан новый профиль.'
+
+        # --- 5. следы вне профиля, пароль, PIN
+        Report-OutsideProfile $u
+        if ($chkPwd.Checked) { $pwdOk = [bool](Reset-Password $u.Name) }
+        if ($chkPin.Checked) { Reset-Pin }
+
+        Log "ОЧИСТКА ЗАВЕРШЕНА. При следующем входе $($u.Name) получит чистый профиль."
+        if (Test-Path -LiteralPath $p.Manifest) { Warn "Для $($u.Name) есть старый эталон ($($p.Golden)). После настройки нового профиля снимите эталон заново." }
+        Set-Status 'Готово.'
+    } finally {
+        Start-Indexer
+    }
+
+    if (-not $pwdOk) {
+        [System.Windows.Forms.MessageBox]::Show($form,
+            "Профиль очищен, но пароль пользователя '$($u.Name)' НЕ сброшен на пустой.`n`nВыполните в консоли администратора:`n  net accounts /minpwlen:0`n  net user $($u.Name) `"`"`n`nПерезагрузка отменена - сделайте её вручную после сброса пароля.",
+            'GoldenUser - пароль не сброшен', 'OK', 'Warning') | Out-Null
+        Warn 'Перезагрузка отменена: сначала сбросьте пароль.'
+        return
+    }
+    if ($chkReboot.Checked) {
+        Log 'Перезагрузка через 15 секунд...'
+        & shutdown.exe /r /t 15 /c "GoldenUser: профиль очищен, перезагрузка" | Out-Null
+    } else {
+        Warn 'Перезагрузите компьютер перед тем, как входить под пользователем.'
+    }
+}
+
 # ------------------------------------------------------------------ обработчики
 function Run-Safely([scriptblock]$Action) {
     Set-Busy $true
@@ -650,6 +790,7 @@ function Run-Safely([scriptblock]$Action) {
 $btnCheck.Add_Click({    Run-Safely { Do-Check } })
 $btnSnapshot.Add_Click({ Run-Safely { Do-Snapshot } })
 $btnRestore.Add_Click({  Run-Safely { Do-Restore } })
+$btnClean.Add_Click({    Run-Safely { Do-Clean } })
 $btnOpen.Add_Click({
     try { $p = Get-Paths; Ensure-GoldenRoot $p.GoldenRoot; Start-Process explorer.exe "`"$($p.GoldenRoot)`"" } catch { Fail $_.Exception.Message }
 })
