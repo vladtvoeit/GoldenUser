@@ -86,19 +86,20 @@ $txtUser   = New-TextBox $User       140  12 200
 $txtUser.Anchor = 'Top,Left'
 New-Label 'Папка эталонов:'    12  44 120 | Out-Null
 $txtGolden = New-TextBox $GoldenRoot 140  42 590
-New-Label 'Папка резервных копий:' 12 74 125 | Out-Null
+New-Label 'Резервные копии:'  12  74 125 | Out-Null
 $txtBackup = New-TextBox $BackupRoot 140  72 590
 
 $chkPwd    = New-CheckBox 'Сбросить пароль пользователя на пустой'              12 104 360 $true
 $chkPin    = New-CheckBox 'Сбросить PIN (Windows Hello) - для всех учёток ПК'   12 128 360 $false
-$chkBackup = New-CheckBox 'Сохранить старый профиль в папку резервных копий'   380 104 360 $true
-$chkReboot = New-CheckBox 'Перезагрузить компьютер после восстановления/очистки' 380 128 360 $true
+$chkBackup = New-CheckBox 'Сохранить старый профиль в папку резервных копий'   380 104 360 $false
+$chkReboot = New-CheckBox 'Перезагрузить компьютер после восстановления/очистки' 380 128 360 $false
 
-$btnCheck    = New-Button 'Проверить'              12  162 104
-$btnSnapshot = New-Button 'Снять эталон'           122 162 120
-$btnRestore  = New-Button 'ВОССТАНОВИТЬ'           248 162 150
+# Порядок создания = порядок перехода по Tab.
+$btnClean    = New-Button 'Очистить профиль'       12  162 150
+$btnCheck    = New-Button 'Проверить'              168 162 104
+$btnSnapshot = New-Button 'Снять эталон'           278 162 120
+$btnRestore  = New-Button 'ВОССТАНОВИТЬ'           404 162 150
 $btnRestore.Font = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
-$btnClean    = New-Button 'Очистить профиль'       404 162 150
 $btnOpen     = New-Button 'Папка эталонов'         560 162 170
 
 $txtLog = New-Object System.Windows.Forms.TextBox
@@ -727,7 +728,7 @@ function Do-Clean {
     $actions += "Будет выполнено для пользователя '$($u.Name)':`n`n" +
         " 1. Принудительный выход пользователя из системы.`n"
     if ($targets.Count) {
-        $actions += " 2. " + $(if ($chkBackup.Checked) { "Копируются в $($p.BackupRoot), затем " } else { '' }) +
+        $actions += " 2. " + $(if ($chkBackup.Checked) { "Копируются в $($p.BackupRoot), затем " } else { 'БЕЗ РЕЗЕРВНОЙ КОПИИ ' }) +
             "УДАЛЯЮТСЯ ПОЛНОСТЬЮ (рабочий стол, документы, загрузки, настройки программ,`n    сохранённые пароли, сетевые диски, принтеры, обои):`n" +
             (($targets | ForEach-Object { "      $_" }) -join "`n") + "`n"
     } else {
